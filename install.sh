@@ -21,6 +21,7 @@
 INSTALL_DIR=/root/netflix-proxy
 REPO_URL=https://github.com/ab77/netflix-proxy/archive/latest.tar.gz
 MENU_URL=https://raw.githubusercontent.com/zuri360/netflix-proxy/refs/heads/main/menu2
+DOMAINS_URL=https://raw.githubusercontent.com/zuri360/netflix-proxy/refs/heads/main/proxy-domains.txt
 ADMIN_PASS="${1:-}"
 
 verde='\e[32m'; rojo='\e[31m'; amarillo='\e[33m'; negrita='\e[1m'; reset='\e[0m'
@@ -112,6 +113,22 @@ info "Descargando netflix-proxy..."
 mkdir -p "$INSTALL_DIR" && cd "$INSTALL_DIR" || error "No se pudo crear $INSTALL_DIR"
 curl -fsSL "$REPO_URL" | tar xz --strip-components=1 || error "Falló la descarga."
 ok "Descargado en $INSTALL_DIR"
+
+# ---------- Lista de dominios propia ----------
+info "Descargando tu lista de dominios desde GitHub..."
+if curl -fsSL "$DOMAINS_URL" -o /tmp/proxy-domains.txt \
+   && ! grep -q '<' /tmp/proxy-domains.txt \
+   && grep -qE '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}' /tmp/proxy-domains.txt; then
+    # Limpieza: quita \r de Windows, espacios, líneas vacías y duplicados
+    tr -d '\r' < /tmp/proxy-domains.txt | tr -d ' \t' | tr 'A-Z' 'a-z' \
+        | grep -E '^[a-z0-9.-]+\.[a-z]{2,}$' | awk '!visto[$0]++' > "$INSTALL_DIR/proxy-domains.txt"
+    # ifconfig.co se usa para las pruebas (tunel.sh y el test final)
+    grep -qx 'ifconfig.co' "$INSTALL_DIR/proxy-domains.txt" || echo 'ifconfig.co' >> "$INSTALL_DIR/proxy-domains.txt"
+    ok "Lista propia cargada: $(wc -l < "$INSTALL_DIR/proxy-domains.txt") dominios"
+else
+    echo -e "${amarillo}[AVISO]${reset} No se pudo descargar tu lista; se usa la lista original de netflix-proxy."
+fi
+rm -f /tmp/proxy-domains.txt
 
 # ---------- Parche de IP en build.sh ----------
 sed -i "s|^EXTIP=\$(get_ext_ipaddr 4)|EXTIP=${IP}|" build.sh
