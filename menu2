@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Menú de gestión de netflix-proxy — se abre escribiendo: menu2
+
+CONF=/etc/netflix-proxy-menu.conf
+DIR=/root/netflix-proxy
+DB=$DIR/auth/db/auth.db
+
+verde='\e[32m'; rojo='\e[31m'; amarillo='\e[33m'; negrita='\e[1m'; reset='\e[0m'
+
+[[ $EUID -eq 0 ]] || { echo "Ejecutá menu2 como root."; exit 1; }
+[[ -f $CONF ]] || { echo "Falta $CONF. Reinstalá con install.sh."; exit 1; }
+. "$CONF"   # define IP y ADMIN_PASS
+
+valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+pausa()    { echo; read -rp "Enter para volver al menú..." _; }
+
+agregar_ip() {
+    read -rp "IP a autorizar: " nueva
+    nueva=$(echo "$nueva" | tr -d ' ')
+    valid_ip "$nueva" || { echo -e "${rojo}IP no válida.${reset}"; return; }
+    curl -s -o /dev/null "http://${IP}:8080/autoadd?ip=${nueva}&username=admin&password=${ADMIN_PASS}"
+    # El panel a veces no aplica la regla en el firewall: se asegura acá
+    if ! iptables -t nat -C PREROUTING -s "${nueva}/32" -i eth0 -j ACCEPT 2>/dev/null; then
+        iptables -t nat -I PREROUTING -s "${nueva}/32" -i eth0 -j ACCEPT
+    fi
+    netfilter-persistent save >/dev/null 2>&1
+    if sqlite3 "$DB" "SELECT 1 FROM IPADDRS WHERE ipaddr='${nueva}' LIMIT 1;" | grep -q 1; then
+        echo -e "${verde}IP ${nueva} autorizada (panel + firewall).${reset}"
+    else
+        echo -e "${amarillo}Firewall OK, pero el panel no la registró. Revisá la contraseña en ${CONF}.${reset}"
+    fi
+}
+
+ver_ips() {
+    echo -e "${negrita}IPs autorizadas:${reset}"
+    sqlite3 -header -column "$DB" "SELECT ID, created, ipaddr FROM IPADDRS ORDER BY ID;"
+}
+
+eliminar_ip() {
+    ver_ips; echo
+    read -rp "IP a eliminar: " ip_del
+    ip_del=$(echo "$ip_del" | tr -d ' ')
+    valid_ip "$ip_del" || { echo -e "${rojo}IP no válida.${reset}"; return; }
+    sqlite3 "$DB" "DELETE FROM IPADDRS WHERE ipaddr='${ip_del}';"
+    while iptables -t nat -D PREROUTING -s "${ip_del}/32" -i eth0 -j ACCEPT 2>/dev/null; do :; done
+    netfilter-persistent save >/dev/null 2>&1
+    echo -e "${verde}IP ${ip_del} eliminada (panel + firewall).${reset}"
+}
+
+limpiar_duplicados() {
+    sqlite3 "$DB" "DELETE FROM IPADDRS WHERE ID NOT IN (SELECT MIN(ID) FROM IPADDRS GROUP BY ipaddr);"
+    echo -e "${verde}Duplicados eliminados.${reset}"; ver_ips
+}
+
+agregar_dominio() {
+    read -rp "Dominio a pasar por el proxy (ej: ejemplo.com): " dom
+    dom=$(echo "$dom" | tr -d ' ' | tr 'A-Z' 'a-z')
+    [[ "$dom" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] || { echo -e "${rojo}Dominio no válido.${reset}"; return; }
+    grep -q "^address=/${dom}/" "$DIR/dnsmasq.conf" || echo "address=/${dom}/${IP}" >> "$DIR/dnsmasq.conf"
+    grep -qx "$dom" "$DIR/proxy-domains.txt" || echo "$dom" >> "$DIR/proxy-domains.txt"
+    echo "+ docker restart dnsmasq"; docker restart dnsmasq
+    sleep 2
+    echo "+ dig +short ${dom} @${IP}"; dig +short "$dom" @"$IP"
+    if [[ "$(dig +short "$dom" @"$IP" | head -1)" == "$IP" ]]; then
+        echo -e "${verde}${dom} ahora pasa por el proxy.${reset}"
+    else
+        echo -e "${amarillo}Se agregó, pero dig no responde ${IP}. Revisá dnsmasq.conf.${reset}"
+    fi
+}
+
+comprobar_dominio() {
+    read -rp "Dominio a comprobar (ej: speedtest.net): " dom
+    dom=$(echo "$dom" | tr -d ' ')
+    [[ -n "$dom" ]] || return
+    echo "+ dig +short ${dom} @${IP}"
+    res=$(dig +short "$dom" @"$IP")
+    echo "$res"
+    if echo "$res" | grep -qx "$IP"; then
+        echo -e "${verde}${dom} pasa por el proxy.${reset}"
+    else
+        echo -e "${amarillo}${dom} NO pasa por el proxy (responde su IP real).${reset}"
+    fi
+}
+
+reiniciar_dnsmasq() {
+    echo "+ docker restart dnsmasq"; docker restart dnsmasq
+    echo -e "${verde}dnsmasq reiniciado.${reset}"
+}
+
+ver_dominios() {
+    echo -e "${negrita}Dominios que pasan por el proxy:${reset}"
+    grep -o '^address=/[^/]*/' "$DIR/dnsmasq.conf" | cut -d/ -f2 | sort -u | (column 2>/dev/null || cat)
+}
+
+cambiar_pass() {
+    read -rp "Nueva contraseña admin (6 a 8 letras o números): " np
+    [[ "$np" =~ ^[A-Za-z0-9]{6,8}$ ]] || { echo -e "${rojo}Contraseña no válida.${reset}"; return; }
+    hash=$(cd "$DIR/auth" && "$DIR/venv/bin/python" pbkdf2_sha256_hash.py "$np" | awk '{print $2}')
+    [[ "$hash" == \$pbkdf2-sha256\$* ]] || { echo -e "${rojo}No se pudo generar el hash.${reset}"; return; }
+    sqlite3 "$DB" "UPDATE users SET password='${hash}', expires='2099-12-31' WHERE username='admin';"
+    sed -i "s/^ADMIN_PASS=.*/ADMIN_PASS=${np}/" "$CONF"
+    ADMIN_PASS=$np
+    systemctl restart netflix-proxy-admin
+    echo -e "${verde}Contraseña cambiada a: ${np}${reset}"
+}
+
+estado() {
+    echo -e "${negrita}Contenedores:${reset}"
+    docker ps -a --format 'table {{.Names}}\t{{.Status}}' | grep -E 'NAMES|dnsmasq|sniproxy|caddy'
+    echo
+    systemctl is-active --quiet netflix-proxy-admin \
+        && echo -e " ${verde}●${reset} panel admin activo" || echo -e " ${rojo}●${reset} panel admin detenido"
+}
+
+reiniciar() {
+    docker restart $(docker ps -a --format '{{.Names}}' | grep -E 'dnsmasq|sniproxy|caddy') >/dev/null 2>&1
+    systemctl restart netflix-proxy-admin
+    echo -e "${verde}Servicios reiniciados.${reset}"; echo; estado
+}
+
+while true; do
+    clear
+    echo -e "${negrita}========= NETFLIX-PROXY =========${reset}"
+    echo -e " Panel: http://${IP}:8080/   DNS: ${IP}"
+    echo -e " Admin: admin / ${ADMIN_PASS}"
+    echo "---------------------------------"
+    echo " 1) Agregar IP"
+    echo " 2) Ver IPs autorizadas"
+    echo " 3) Eliminar IP"
+    echo " 4) Limpiar IPs duplicadas"
+    echo " 5) Agregar dominio al proxy"
+    echo " 6) Comprobar dominio (dig)"
+    echo " 7) Ver dominios del proxy"
+    echo " 8) Reiniciar dnsmasq"
+    echo " 9) Cambiar contraseña admin"
+    echo "10) Estado de servicios"
+    echo "11) Reiniciar todos los servicios"
+    echo " 0) Salir"
+    echo "---------------------------------"
+    read -rp "Opción: " op
+    echo
+    case $op in
+        1) agregar_ip ;;
+        2) ver_ips ;;
+        3) eliminar_ip ;;
+        4) limpiar_duplicados ;;
+        5) agregar_dominio ;;
+        6) comprobar_dominio ;;
+        7) ver_dominios ;;
+        8) reiniciar_dnsmasq ;;
+        9) cambiar_pass ;;
+        10) estado ;;
+        11) reiniciar ;;
+        0) exit 0 ;;
+        *) echo "Opción no válida." ;;
+    esac
+    pausa
+done
