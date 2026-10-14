@@ -3,18 +3,24 @@
 #  tunel.sh — se ejecuta en el VPS del TÚNEL (SSH/V2Ray), NO en el proxy.
 #  Desvía todas las consultas DNS (UDP y TCP) hacia el netflix-proxy.
 #
-#  Uso:  bash tunel.sh            -> menú
-#        bash tunel.sh activar    -> activa sin menú
-#        bash tunel.sh quitar     -> quita sin menú
-#        bash tunel.sh estado     -> muestra estado y prueba
+#  Uso:  bash tunel.sh             -> menú
+#        bash tunel.sh activar     -> activa sin menú (usa la IP guardada)
+#        bash tunel.sh quitar      -> quita las reglas
+#        bash tunel.sh estado      -> muestra estado y prueba
 #        bash tunel.sh desinstalar -> revierte todo lo que hizo el script
 #
-#  IP del proxy: por defecto 109.199.101.86. Para otra:
-#        PROXY_IP=1.2.3.4 bash tunel.sh
+#  La IP del proxy se pregunta en "Activar" y se guarda en /etc/tunel-proxy.conf
+#  Sin menú se puede indicar así:  PROXY_IP=1.2.3.4 bash tunel.sh activar
 # =====================================================================
 
-PROXY_IP="${PROXY_IP:-109.199.101.86}"
+CONF=/etc/tunel-proxy.conf
+DEFAULT_PROXY="109.199.101.86"
 TEST_DOMAIN="ifconfig.co"   # viene en la lista por defecto de netflix-proxy
+
+# IP del proxy: 1) variable PROXY_IP  2) la última guardada  3) la de por defecto
+GUARDADA=""
+[[ -f $CONF ]] && GUARDADA=$(grep -oP '^PROXY_IP=\K.*' "$CONF")
+PROXY_IP="${PROXY_IP:-${GUARDADA:-$DEFAULT_PROXY}}"
 
 verde='\e[32m'; rojo='\e[31m'; amarillo='\e[33m'; negrita='\e[1m'; reset='\e[0m'
 ok()    { echo -e "${verde}[ OK ]${reset} $*"; }
@@ -23,15 +29,36 @@ fallo() { echo -e "${rojo}[FALLO]${reset} $*"; }
 
 [[ $EUID -eq 0 ]] || { echo "Ejecutá como root."; exit 1; }
 
+valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
 # Se excluye 127.0.0.0/8: si no, también se desvía el resolver local (127.0.0.53)
 # y el propio VPS se queda sin poder resolver nombres.
-regla()        { echo "! -d 127.0.0.0/8 -p $1 --dport 53 -j DNAT --to-destination ${PROXY_IP}:53"; }
-regla_vieja()  { echo "-p $1 --dport 53 -j DNAT --to-destination ${PROXY_IP}:53"; }
+regla() { echo "! -d 127.0.0.0/8 -p $1 --dport 53 -j DNAT --to-destination ${PROXY_IP}:53"; }
 
-limpiar_viejas() {
-    for p in udp tcp; do
-        while iptables -t nat -D OUTPUT $(regla_vieja $p) 2>/dev/null; do :; done
-    done
+# Borra TODAS las reglas DNAT de DNS, apunten al proxy que apunten
+# (proxy viejo, proxy nuevo, con o sin exclusión de loopback). Devuelve cuántas borró.
+limpiar_todas() {
+    local n=0 r
+    while read -r r; do
+        [[ -z "$r" ]] && continue
+        iptables -t nat ${r/-A OUTPUT/-D OUTPUT} 2>/dev/null && n=$((n+1))
+    done < <(iptables -t nat -S OUTPUT | grep -- '--dport 53' | grep -- '-j DNAT')
+    echo "$n"
+}
+
+pedir_proxy() {
+    local nueva
+    echo -e "${negrita}IP del servidor netflix-proxy${reset}"
+    read -rp "IP del proxy [Enter = ${PROXY_IP}]: " nueva
+    nueva=$(echo "${nueva:-$PROXY_IP}" | tr -d ' ')
+    valid_ip "$nueva" || { fallo "IP no válida: $nueva"; return 1; }
+    if [[ -n "$GUARDADA" && "$nueva" != "$GUARDADA" ]]; then
+        info "Cambiando de proxy: ${GUARDADA} -> ${nueva}"
+    fi
+    PROXY_IP="$nueva"
+    echo "PROXY_IP=${PROXY_IP}" > "$CONF"
+    GUARDADA="$PROXY_IP"
+    ok "Proxy: ${PROXY_IP} (guardado en ${CONF})"
 }
 
 dependencias() {
@@ -71,14 +98,21 @@ probar_internet() {
 }
 
 activar() {
-    limpiar_viejas
+    # En el menú pregunta la IP; con "bash tunel.sh activar" usa la guardada
+    if [[ "$1" != "auto" ]]; then
+        pedir_proxy || return
+    else
+        valid_ip "$PROXY_IP" || { fallo "IP del proxy no válida: $PROXY_IP"; return; }
+        echo "PROXY_IP=${PROXY_IP}" > "$CONF"
+    fi
+
+    # Borra las reglas anteriores (incluidas las que apuntan a otro proxy)
+    local n; n=$(limpiar_todas)
+    [[ $n -gt 0 ]] && info "Reglas anteriores quitadas: $n"
+
     dependencias || return
     for p in udp tcp; do
-        if iptables -t nat -C OUTPUT $(regla $p) >/dev/null 2>&1; then
-            ok "Regla $p ya estaba activa"
-        else
-            iptables -t nat -A OUTPUT $(regla $p) && ok "Regla $p agregada"
-        fi
+        iptables -t nat -A OUTPUT $(regla $p) && ok "Regla $p agregada -> ${PROXY_IP}"
     done
 
     info "Probando..."
@@ -95,57 +129,47 @@ activar() {
 
     # Si el VPS se quedó sin internet, se deshace todo para no dejarlo roto
     if ! probar_internet; then
-        for p in udp tcp; do
-            while iptables -t nat -D OUTPUT $(regla $p) 2>/dev/null; do :; done
-        done
+        limpiar_todas >/dev/null
         echo -e "${amarillo}Se quitaron las reglas para no dejar el VPS sin internet. Revisá el proxy.${reset}"
     fi
     guardar
 }
 
 quitar() {
-    limpiar_viejas
-    for p in udp tcp; do
-        local n=0
-        while iptables -t nat -D OUTPUT $(regla $p) 2>/dev/null; do n=$((n+1)); done
-        [[ $n -gt 0 ]] && ok "Regla $p quitada" || info "Regla $p no estaba activa"
-    done
+    local n; n=$(limpiar_todas)
+    [[ $n -gt 0 ]] && ok "Reglas quitadas: $n" || info "No había reglas activas"
     command -v netfilter-persistent >/dev/null && guardar
     echo "El DNS de este VPS volvió a la normalidad."
 }
 
 estado() {
-    echo -e "${negrita}Proxy configurado:${reset} $PROXY_IP"
-    for p in udp tcp; do
-        iptables -t nat -C OUTPUT $(regla $p) >/dev/null 2>&1 \
-            && echo -e " ${verde}●${reset} Regla $p activa" || echo -e " ${rojo}●${reset} Regla $p inactiva"
-    done
+    echo -e "${negrita}Proxy guardado:${reset} ${GUARDADA:-ninguno} (en uso: $PROXY_IP)"
+    echo -e "${negrita}Reglas DNAT de DNS activas:${reset}"
+    local reglas
+    reglas=$(iptables -t nat -S OUTPUT | grep -- '--dport 53' | grep -- '-j DNAT')
+    if [[ -n "$reglas" ]]; then
+        echo "$reglas" | sed 's/^/  /'
+    else
+        echo "  (ninguna)"
+    fi
     command -v dig >/dev/null && { echo; probar; }
     probar_internet
 }
 
 desinstalar() {
     echo -e "${negrita}Esto revierte todo lo que hizo tunel.sh en este VPS:${reset}"
-    echo " - Quita las reglas DNAT de DNS (nuevas y viejas, UDP y TCP)"
+    echo " - Quita todas las reglas DNAT de DNS (de cualquier proxy, UDP y TCP)"
     echo " - Guarda el firewall sin esas reglas"
+    echo " - Borra la IP guardada (${CONF})"
     echo " - Opcional: desinstala iptables-persistent y dnsutils"
     read -rp "¿Continuar? (s/n): " r
     [[ "$r" =~ ^[sS]$ ]] || { echo "Cancelado."; return; }
 
-    # 1) Reglas nuevas (con exclusión de loopback) y viejas (sin exclusión)
-    local n=0
-    for p in udp tcp; do
-        while iptables -t nat -D OUTPUT $(regla $p) 2>/dev/null; do n=$((n+1)); done
-        while iptables -t nat -D OUTPUT $(regla_vieja $p) 2>/dev/null; do n=$((n+1)); done
-    done
+    local n; n=$(limpiar_todas)
     ok "Reglas DNAT quitadas: $n"
+    command -v netfilter-persistent >/dev/null && guardar
+    rm -f "$CONF" && GUARDADA="" && ok "IP guardada borrada"
 
-    # 2) Guardar el firewall limpio
-    if command -v netfilter-persistent >/dev/null; then
-        guardar
-    fi
-
-    # 3) Paquetes instalados por el script (opcional)
     read -rp "¿Desinstalar también iptables-persistent y dnsutils? (s/n): " r2
     if [[ "$r2" =~ ^[sS]$ ]]; then
         echo -e "${amarillo}Ojo: sin iptables-persistent, ninguna regla de firewall se restaura al reiniciar.${reset}"
@@ -157,23 +181,22 @@ desinstalar() {
         fi
     fi
 
-    # 4) Comprobar que el VPS resuelve normal
     probar_internet
     echo -e "${verde}Desinstalación completa. El DNS de este VPS volvió a la normalidad.${reset}"
     echo "Recordá quitar la IP de este VPS en el proxy: menu2 -> opción 3."
 }
 
 case "$1" in
-    activar) activar; exit ;;
-    quitar)  quitar;  exit ;;
-    estado)  estado;  exit ;;
+    activar)     activar auto; exit ;;
+    quitar)      quitar;  exit ;;
+    estado)      estado;  exit ;;
     desinstalar) desinstalar; exit ;;
 esac
 
 while true; do
     clear
     echo -e "${negrita}====== TÚNEL -> NETFLIX-PROXY ======${reset}"
-    echo " Proxy DNS: $PROXY_IP"
+    echo " Proxy DNS: ${GUARDADA:-sin configurar (por defecto $PROXY_IP)}"
     echo "------------------------------------"
     echo " 1) Activar (UDP + TCP) y guardar"
     echo " 2) Quitar reglas"
