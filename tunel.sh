@@ -57,6 +57,18 @@ probar() {
     [[ "$tcp" == "$PROXY_IP" ]] && ok "DNS TCP -> proxy ($tcp)" || fallo "DNS TCP responde: ${tcp:-sin respuesta}"
 }
 
+probar_internet() {
+    local r
+    r=$(curl -sI --max-time 10 https://raw.githubusercontent.com | head -1 | tr -d '\r')
+    if [[ -n "$r" ]]; then
+        ok "Internet del VPS OK (GitHub responde: $r)"
+        return 0
+    else
+        fallo "El VPS no puede resolver/conectar a GitHub"
+        return 1
+    fi
+}
+
 activar() {
     limpiar_viejas
     dependencias || return
@@ -79,6 +91,14 @@ activar() {
         echo "En el proxy ejecutá: menu2 -> opción 1 -> la IP de este VPS"
         echo "(o: iptables -I INPUT -s IP_DE_ESTE_VPS/32 -p tcp --dport 53 -j ACCEPT)"
     fi
+
+    # Si el VPS se quedó sin internet, se deshace todo para no dejarlo roto
+    if ! probar_internet; then
+        for p in udp tcp; do
+            while iptables -t nat -D OUTPUT $(regla $p) 2>/dev/null; do :; done
+        done
+        echo -e "${amarillo}Se quitaron las reglas para no dejar el VPS sin internet. Revisá el proxy.${reset}"
+    fi
     guardar
 }
 
@@ -100,6 +120,7 @@ estado() {
             && echo -e " ${verde}●${reset} Regla $p activa" || echo -e " ${rojo}●${reset} Regla $p inactiva"
     done
     command -v dig >/dev/null && { echo; probar; }
+    probar_internet
 }
 
 case "$1" in
