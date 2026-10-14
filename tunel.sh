@@ -13,7 +13,7 @@
 # =====================================================================
 
 PROXY_IP="${PROXY_IP:-109.199.101.86}"
-TEST_DOMAIN="api.fast.com"
+TEST_DOMAIN="ifconfig.co"   # viene en la lista por defecto de netflix-proxy
 
 verde='\e[32m'; rojo='\e[31m'; amarillo='\e[33m'; negrita='\e[1m'; reset='\e[0m'
 ok()    { echo -e "${verde}[ OK ]${reset} $*"; }
@@ -22,7 +22,16 @@ fallo() { echo -e "${rojo}[FALLO]${reset} $*"; }
 
 [[ $EUID -eq 0 ]] || { echo "Ejecutá como root."; exit 1; }
 
-regla() { echo "-p $1 --dport 53 -j DNAT --to-destination ${PROXY_IP}:53"; }
+# Se excluye 127.0.0.0/8: si no, también se desvía el resolver local (127.0.0.53)
+# y el propio VPS se queda sin poder resolver nombres.
+regla()        { echo "! -d 127.0.0.0/8 -p $1 --dport 53 -j DNAT --to-destination ${PROXY_IP}:53"; }
+regla_vieja()  { echo "-p $1 --dport 53 -j DNAT --to-destination ${PROXY_IP}:53"; }
+
+limpiar_viejas() {
+    for p in udp tcp; do
+        while iptables -t nat -D OUTPUT $(regla_vieja $p) 2>/dev/null; do :; done
+    done
+}
 
 dependencias() {
     export DEBIAN_FRONTEND=noninteractive
@@ -49,9 +58,10 @@ probar() {
 }
 
 activar() {
+    limpiar_viejas
     dependencias || return
     for p in udp tcp; do
-        if iptables -t nat -C OUTPUT $(regla $p) 2>/dev/null; then
+        if iptables -t nat -C OUTPUT $(regla $p) >/dev/null 2>&1; then
             ok "Regla $p ya estaba activa"
         else
             iptables -t nat -A OUTPUT $(regla $p) && ok "Regla $p agregada"
@@ -73,6 +83,7 @@ activar() {
 }
 
 quitar() {
+    limpiar_viejas
     for p in udp tcp; do
         local n=0
         while iptables -t nat -D OUTPUT $(regla $p) 2>/dev/null; do n=$((n+1)); done
@@ -85,7 +96,7 @@ quitar() {
 estado() {
     echo -e "${negrita}Proxy configurado:${reset} $PROXY_IP"
     for p in udp tcp; do
-        iptables -t nat -C OUTPUT $(regla $p) 2>/dev/null \
+        iptables -t nat -C OUTPUT $(regla $p) >/dev/null 2>&1 \
             && echo -e " ${verde}●${reset} Regla $p activa" || echo -e " ${rojo}●${reset} Regla $p inactiva"
     done
     command -v dig >/dev/null && { echo; probar; }
