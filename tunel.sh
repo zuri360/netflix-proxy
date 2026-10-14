@@ -7,6 +7,7 @@
 #        bash tunel.sh activar    -> activa sin menú
 #        bash tunel.sh quitar     -> quita sin menú
 #        bash tunel.sh estado     -> muestra estado y prueba
+#        bash tunel.sh desinstalar -> revierte todo lo que hizo el script
 #
 #  IP del proxy: por defecto 109.199.101.86. Para otra:
 #        PROXY_IP=1.2.3.4 bash tunel.sh
@@ -123,10 +124,50 @@ estado() {
     probar_internet
 }
 
+desinstalar() {
+    echo -e "${negrita}Esto revierte todo lo que hizo tunel.sh en este VPS:${reset}"
+    echo " - Quita las reglas DNAT de DNS (nuevas y viejas, UDP y TCP)"
+    echo " - Guarda el firewall sin esas reglas"
+    echo " - Opcional: desinstala iptables-persistent y dnsutils"
+    read -rp "¿Continuar? (s/n): " r
+    [[ "$r" =~ ^[sS]$ ]] || { echo "Cancelado."; return; }
+
+    # 1) Reglas nuevas (con exclusión de loopback) y viejas (sin exclusión)
+    local n=0
+    for p in udp tcp; do
+        while iptables -t nat -D OUTPUT $(regla $p) 2>/dev/null; do n=$((n+1)); done
+        while iptables -t nat -D OUTPUT $(regla_vieja $p) 2>/dev/null; do n=$((n+1)); done
+    done
+    ok "Reglas DNAT quitadas: $n"
+
+    # 2) Guardar el firewall limpio
+    if command -v netfilter-persistent >/dev/null; then
+        guardar
+    fi
+
+    # 3) Paquetes instalados por el script (opcional)
+    read -rp "¿Desinstalar también iptables-persistent y dnsutils? (s/n): " r2
+    if [[ "$r2" =~ ^[sS]$ ]]; then
+        echo -e "${amarillo}Ojo: sin iptables-persistent, ninguna regla de firewall se restaura al reiniciar.${reset}"
+        read -rp "¿Seguro? (s/n): " r3
+        if [[ "$r3" =~ ^[sS]$ ]]; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -y -qq remove iptables-persistent netfilter-persistent dnsutils >/dev/null 2>&1 \
+                && ok "Paquetes desinstalados" || fallo "No se pudieron desinstalar los paquetes"
+        fi
+    fi
+
+    # 4) Comprobar que el VPS resuelve normal
+    probar_internet
+    echo -e "${verde}Desinstalación completa. El DNS de este VPS volvió a la normalidad.${reset}"
+    echo "Recordá quitar la IP de este VPS en el proxy: menu2 -> opción 3."
+}
+
 case "$1" in
     activar) activar; exit ;;
     quitar)  quitar;  exit ;;
     estado)  estado;  exit ;;
+    desinstalar) desinstalar; exit ;;
 esac
 
 while true; do
@@ -137,6 +178,7 @@ while true; do
     echo " 1) Activar (UDP + TCP) y guardar"
     echo " 2) Quitar reglas"
     echo " 3) Estado y prueba"
+    echo " 4) Desinstalar"
     echo " 0) Salir"
     echo "------------------------------------"
     read -rp "Opción: " op
@@ -145,6 +187,7 @@ while true; do
         1) activar ;;
         2) quitar ;;
         3) estado ;;
+        4) desinstalar ;;
         0) exit 0 ;;
         *) echo "Opción no válida." ;;
     esac
