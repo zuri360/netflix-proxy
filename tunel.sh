@@ -3,7 +3,9 @@
 #  tunel.sh — se ejecuta en el VPS del TÚNEL (SSH/V2Ray), NO en el proxy.
 #  Desvía todas las consultas DNS (UDP y TCP) hacia el netflix-proxy.
 #
-#  Uso:  bash tunel.sh             -> menú
+#  La primera vez se instala solo en /root/tunel.sh y crea el comando: dns
+#
+#  Uso:  dns  (o bash tunel.sh)     -> menú
 #        bash tunel.sh activar     -> activa sin menú (usa la IP guardada)
 #        bash tunel.sh quitar      -> quita las reglas
 #        bash tunel.sh estado      -> muestra estado y prueba
@@ -28,6 +30,33 @@ info()  { echo -e "${amarillo}[ .. ]${reset} $*"; }
 fallo() { echo -e "${rojo}[FALLO]${reset} $*"; }
 
 [[ $EUID -eq 0 ]] || { echo "Ejecutá como root."; exit 1; }
+
+SCRIPT_URL="https://raw.githubusercontent.com/zuri360/netflix-proxy/refs/heads/main/tunel.sh"
+LOCAL_SCRIPT=/root/tunel.sh
+CMD=/usr/local/bin/dns
+
+# Guarda una copia local y crea el comando "dns", así se puede usar
+# aunque el DNS del VPS esté roto y no se pueda descargar de GitHub.
+autoinstalar() {
+    local origen
+    origen=$(readlink -f "$0" 2>/dev/null)
+    if [[ "$origen" != "$LOCAL_SCRIPT" ]]; then
+        if [[ -f "$origen" ]]; then
+            cp "$origen" "$LOCAL_SCRIPT"                       # ejecutado desde un archivo
+        else
+            curl -fsSL --max-time 15 "$SCRIPT_URL" -o "${LOCAL_SCRIPT}.tmp" \
+                && head -1 "${LOCAL_SCRIPT}.tmp" | grep -q '^#!/usr/bin/env bash' \
+                && mv "${LOCAL_SCRIPT}.tmp" "$LOCAL_SCRIPT"    # ejecutado con bash <(curl ...)
+            rm -f "${LOCAL_SCRIPT}.tmp"
+        fi
+        chmod +x "$LOCAL_SCRIPT" 2>/dev/null
+    fi
+    if [[ -f "$LOCAL_SCRIPT" && ! -x "$CMD" ]]; then
+        printf '#!/usr/bin/env bash\nexec bash %s "$@"\n' "$LOCAL_SCRIPT" > "$CMD"
+        chmod +x "$CMD"
+    fi
+}
+autoinstalar
 
 valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
@@ -162,6 +191,7 @@ desinstalar() {
     echo " - Guarda el firewall sin esas reglas"
     echo " - Borra la IP guardada (${CONF})"
     echo " - Opcional: desinstala iptables-persistent y dnsutils"
+    echo " - Opcional: borra el comando dns y /root/tunel.sh"
     read -rp "¿Continuar? (s/n): " r
     [[ "$r" =~ ^[sS]$ ]] || { echo "Cancelado."; return; }
 
@@ -181,6 +211,11 @@ desinstalar() {
         fi
     fi
 
+    read -rp "¿Borrar también el comando dns y /root/tunel.sh? (s/n): " r4
+    if [[ "$r4" =~ ^[sS]$ ]]; then
+        rm -f "$CMD" "$LOCAL_SCRIPT" && ok "Comando dns y /root/tunel.sh borrados"
+    fi
+
     probar_internet
     echo -e "${verde}Desinstalación completa. El DNS de este VPS volvió a la normalidad.${reset}"
     echo "Recordá quitar la IP de este VPS en el proxy: menu2 -> opción 3."
@@ -197,6 +232,7 @@ while true; do
     clear
     echo -e "${negrita}====== TÚNEL -> NETFLIX-PROXY ======${reset}"
     echo " Proxy DNS: ${GUARDADA:-sin configurar (por defecto $PROXY_IP)}"
+    echo " Comando:   dns   (copia local: $LOCAL_SCRIPT)"
     echo "------------------------------------"
     echo " 1) Activar (UDP + TCP) y guardar"
     echo " 2) Quitar reglas"
