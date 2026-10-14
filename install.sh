@@ -47,6 +47,12 @@ echo "No lo uses en un VPS donde tengas otros paneles VPN funcionando."
 read -rp "¿Continuar? (s/n): " resp
 [[ "$resp" =~ ^[sS]$ ]] || error "Instalación cancelada."
 
+read -rp "IP del VPS del túnel SSH/V2Ray a autorizar (Enter para omitir): " TUNNEL_IP
+TUNNEL_IP=$(echo "$TUNNEL_IP" | tr -d ' ')
+if [[ -n "$TUNNEL_IP" && ! "$TUNNEL_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    error "IP del túnel no válida: $TUNNEL_IP"
+fi
+
 # ---------- Paquetes ----------
 info "Instalando paquetes del sistema..."
 export DEBIAN_FRONTEND=noninteractive
@@ -156,6 +162,19 @@ sqlite3 db/auth.db "UPDATE users SET password='${HASH}', expires='2099-12-31' WH
 systemctl restart netflix-proxy-admin
 ok "Admin configurado (vence 2099-12-31)"
 
+# ---------- VPS del túnel ----------
+if [[ -n "$TUNNEL_IP" ]]; then
+    info "Autorizando VPS del túnel ${TUNNEL_IP}..."
+    curl -s -o /dev/null "http://${IP}:8080/autoadd?ip=${TUNNEL_IP}&username=admin&password=${ADMIN_PASS}"
+    iptables -t nat -C PREROUTING -s "${TUNNEL_IP}/32" -i eth0 -j ACCEPT 2>/dev/null \
+        || iptables -t nat -I PREROUTING -s "${TUNNEL_IP}/32" -i eth0 -j ACCEPT
+    # DNS por TCP: solo para esta IP (las apps con DNS Forwarding consultan por TCP)
+    iptables -C INPUT -s "${TUNNEL_IP}/32" -p tcp --dport 53 -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT -s "${TUNNEL_IP}/32" -p tcp --dport 53 -j ACCEPT
+    netfilter-persistent save >/dev/null 2>&1
+    ok "VPS del túnel autorizado (panel + firewall + DNS TCP)"
+fi
+
 # ---------- Menú (menu2) ----------
 info "Instalando menú de gestión (comando: menu2)..."
 cat > /etc/netflix-proxy-menu.conf <<CONFEOF
@@ -192,4 +211,13 @@ echo -e "${verde}${negrita}============================================${reset}"
 echo -e " Menú:        ${negrita}menu2${reset} (agregar/ver/eliminar IPs, dominios, contraseña)"
 echo " - Autorizá la IP de cada cliente desde el panel (botón Add) o con menu2."
 echo " - Desactivá IPv6 y el 'DNS seguro' del navegador en los dispositivos."
+if [[ -n "$TUNNEL_IP" ]]; then
+    echo
+    echo -e "${negrita}En el VPS del túnel (${TUNNEL_IP}) ejecutá:${reset}"
+    echo "  iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination ${IP}:53"
+    echo "  iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination ${IP}:53"
+    echo "  apt-get -y install iptables-persistent && netfilter-persistent save"
+    echo " En la app VPN: DNS 8.8.8.8 / 8.8.4.4 con DNS Forwarding marcado."
+    echo " (También podés verlo con: menu2 -> opción 12)"
+fi
 echo " - Netflix suele bloquear IPs de datacenter aunque todo esté bien instalado."

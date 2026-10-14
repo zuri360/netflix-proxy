@@ -23,9 +23,13 @@ agregar_ip() {
     if ! iptables -t nat -C PREROUTING -s "${nueva}/32" -i eth0 -j ACCEPT 2>/dev/null; then
         iptables -t nat -I PREROUTING -s "${nueva}/32" -i eth0 -j ACCEPT
     fi
+    # DNS por TCP (necesario cuando la IP es un VPS de túnel con DNS Forwarding)
+    if ! iptables -C INPUT -s "${nueva}/32" -p tcp --dport 53 -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT -s "${nueva}/32" -p tcp --dport 53 -j ACCEPT
+    fi
     netfilter-persistent save >/dev/null 2>&1
     if sqlite3 "$DB" "SELECT 1 FROM IPADDRS WHERE ipaddr='${nueva}' LIMIT 1;" | grep -q 1; then
-        echo -e "${verde}IP ${nueva} autorizada (panel + firewall).${reset}"
+        echo -e "${verde}IP ${nueva} autorizada (panel + firewall + DNS TCP).${reset}"
     else
         echo -e "${amarillo}Firewall OK, pero el panel no la registró. Revisá la contraseña en ${CONF}.${reset}"
     fi
@@ -43,6 +47,7 @@ eliminar_ip() {
     valid_ip "$ip_del" || { echo -e "${rojo}IP no válida.${reset}"; return; }
     sqlite3 "$DB" "DELETE FROM IPADDRS WHERE ipaddr='${ip_del}';"
     while iptables -t nat -D PREROUTING -s "${ip_del}/32" -i eth0 -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D INPUT -s "${ip_del}/32" -p tcp --dport 53 -j ACCEPT 2>/dev/null; do :; done
     netfilter-persistent save >/dev/null 2>&1
     echo -e "${verde}IP ${ip_del} eliminada (panel + firewall).${reset}"
 }
@@ -118,6 +123,18 @@ reiniciar() {
     echo -e "${verde}Servicios reiniciados.${reset}"; echo; estado
 }
 
+comandos_tunel() {
+    echo -e "${negrita}Ejecutá esto en el VPS del túnel (SSH/V2Ray):${reset}"
+    echo
+    echo "iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination ${IP}:53"
+    echo "iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination ${IP}:53"
+    echo "apt-get -y install iptables-persistent"
+    echo "netfilter-persistent save"
+    echo
+    echo -e "${amarillo}Antes, autorizá la IP de ese VPS con la opción 1.${reset}"
+    echo "En la app VPN: DNS 8.8.8.8 / 8.8.4.4 con DNS Forwarding marcado."
+}
+
 while true; do
     clear
     echo -e "${negrita}========= NETFLIX-PROXY =========${reset}"
@@ -135,6 +152,7 @@ while true; do
     echo " 9) Cambiar contraseña admin"
     echo "10) Estado de servicios"
     echo "11) Reiniciar todos los servicios"
+    echo "12) Comandos para el VPS del túnel"
     echo " 0) Salir"
     echo "---------------------------------"
     read -rp "Opción: " op
@@ -151,6 +169,7 @@ while true; do
         9) cambiar_pass ;;
         10) estado ;;
         11) reiniciar ;;
+        12) comandos_tunel ;;
         0) exit 0 ;;
         *) echo "Opción no válida." ;;
     esac
