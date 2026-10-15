@@ -114,6 +114,25 @@ probar() {
     [[ "$tcp" == "$PROXY_IP" ]] && ok "DNS TCP -> proxy ($tcp)" || fallo "DNS TCP responde: ${tcp:-sin respuesta}"
 }
 
+ip_local() {
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}'
+}
+
+msg_no_autorizado() {
+    echo
+    echo -e "${amarillo}${negrita}PROBABLEMENTE TU IP NO ESTA AUTORIZADA CONTACTA AL ADMINISTRADOR${reset}"
+    echo -e "${amarillo}IP de este VPS: $(ip_local)${reset}"
+    echo
+}
+
+# Si la IP no está autorizada, el proxy responde SU propia IP para cualquier dominio
+# (incluso los que no están en la lista). Se prueba con example.com.
+no_autorizado() {
+    local r
+    r=$(dig +short +time=3 +tries=1 example.com @8.8.8.8 | tail -1)
+    [[ "$r" == "$PROXY_IP" ]]
+}
+
 probar_internet() {
     local r
     r=$(curl -sI --max-time 10 https://raw.githubusercontent.com | head -1 | tr -d '\r')
@@ -146,14 +165,27 @@ activar() {
 
     info "Probando..."
     sleep 1
+
+    # Primero se verifica la autorización: si no está autorizada, la prueba
+    # UDP daría un falso [ OK ] (el proxy responde su IP para todo)
+    if no_autorizado; then
+        limpiar_todas >/dev/null
+        fallo "El proxy responde su IP para cualquier dominio (ej: example.com)"
+        msg_no_autorizado
+        echo "Se quitaron las reglas para no dejar sin internet a los usuarios del túnel."
+        echo "Cuando autoricen la IP, volvé a usar la opción 1."
+        guardar
+        return
+    fi
     probar
 
     # Si TCP no responde, se quita para no dejar el VPS sin DNS por TCP
     if ! dig +tcp +short +time=3 +tries=1 "$TEST_DOMAIN" @8.8.8.8 | grep -qx "$PROXY_IP"; then
         while iptables -t nat -D OUTPUT $(regla tcp) 2>/dev/null; do :; done
         echo -e "${amarillo}Se quitó la regla TCP porque el proxy no responde por TCP.${reset}"
-        echo "En el proxy ejecutá: menu2 -> opción 1 -> la IP de este VPS"
-        echo "(o: iptables -I INPUT -s IP_DE_ESTE_VPS/32 -p tcp --dport 53 -j ACCEPT)"
+        msg_no_autorizado
+        echo "En el proxy ejecutá: menu2 -> opción 1 -> $(ip_local)"
+        echo "(o: iptables -I INPUT -s $(ip_local)/32 -p tcp --dport 53 -j ACCEPT)"
     fi
 
     # Si el VPS se quedó sin internet, se deshace todo para no dejarlo roto
@@ -181,7 +213,15 @@ estado() {
     else
         echo "  (ninguna)"
     fi
-    command -v dig >/dev/null && { echo; probar; }
+    if command -v dig >/dev/null; then
+        echo
+        if [[ -n "$reglas" ]] && no_autorizado; then
+            fallo "El proxy responde su IP para cualquier dominio"
+            msg_no_autorizado
+        else
+            probar
+        fi
+    fi
     probar_internet
 }
 
