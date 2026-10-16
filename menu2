@@ -135,6 +135,184 @@ comandos_tunel() {
     echo "En la app VPN: DNS 8.8.8.8 / 8.8.4.4 con DNS Forwarding marcado."
 }
 
+# ======================== BACKUP / RESTORE ========================
+# Los backups se guardan fuera de $DIR para que sobrevivan a una reinstalación.
+BACKUP_DIR=/root/netflix-proxy-backups
+
+# IPs autorizadas en el firewall (nat PREROUTING + INPUT tcp/53), una por línea
+ips_firewall() {
+    {
+        iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- '-i eth0 -j ACCEPT$'
+        iptables -S INPUT 2>/dev/null | grep -E -- '-p tcp .*--dport 53 -j ACCEPT$'
+    } | grep -oE -- '-s [0-9.]+/32' | awk '{sub("/32","",$2); print $2}' | sort -u
+}
+
+# Aplica las dos reglas de la opción 1 a una IP (sin duplicar)
+aplicar_reglas_ip() {
+    local ip=$1
+    iptables -t nat -C PREROUTING -s "${ip}/32" -i eth0 -j ACCEPT 2>/dev/null \
+        || iptables -t nat -I PREROUTING -s "${ip}/32" -i eth0 -j ACCEPT
+    iptables -C INPUT -s "${ip}/32" -p tcp --dport 53 -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT -s "${ip}/32" -p tcp --dport 53 -j ACCEPT
+}
+
+quitar_reglas_ip() {
+    local ip=$1
+    while iptables -t nat -D PREROUTING -s "${ip}/32" -i eth0 -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D INPUT -s "${ip}/32" -p tcp --dport 53 -j ACCEPT 2>/dev/null; do :; done
+}
+
+listar_backups() {
+    mapfile -t BACKUPS < <(ls -1t "$BACKUP_DIR"/np_backup_*.tar.gz 2>/dev/null)
+    if [[ ${#BACKUPS[@]} -eq 0 ]]; then
+        echo -e "${amarillo}No hay backups en ${BACKUP_DIR}.${reset}"
+        return 1
+    fi
+    echo -e "${negrita}Backups (más reciente primero):${reset}"
+    local i=1
+    for b in "${BACKUPS[@]}"; do
+        echo "  $i) $(basename "$b")  ($(du -h "$b" | cut -f1))"
+        i=$((i + 1))
+    done
+}
+
+crear_backup() {
+    [[ -f $DB ]] || { echo -e "${rojo}No se encontró ${DB}.${reset}"; return 1; }
+    mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+    local ts tmp file
+    ts=$(date +%Y%m%d_%H%M%S)
+    tmp=$(mktemp -d)
+    file="$BACKUP_DIR/np_backup_${ts}.tar.gz"
+
+    # Copia consistente de la base aunque el panel esté escribiendo
+    sqlite3 "$DB" ".backup '${tmp}/auth.db'" || { echo -e "${rojo}Falló la copia de auth.db.${reset}"; rm -rf "$tmp"; return 1; }
+    ips_firewall > "$tmp/ips_firewall.txt"
+    cat > "$tmp/info.txt" <<INFO
+FECHA=${ts}
+IP_ORIGEN=${IP}
+ADMIN_PASS=${ADMIN_PASS}
+INFO
+
+    tar -czf "$file" -C "$tmp" auth.db ips_firewall.txt info.txt
+    rm -rf "$tmp"; chmod 600 "$file"
+
+    echo -e "${verde}Backup creado:${reset} $file"
+    echo "  IPs en la base: $(sqlite3 "$DB" 'SELECT COUNT(*) FROM IPADDRS;')"
+    echo "  IPs en el firewall: $(ips_firewall | wc -l)"
+    echo
+    echo -e "${negrita}Para descargarlo a tu PC, ejecutá en tu PC:${reset}"
+    echo "  scp root@${IP}:${file} ."
+}
+
+restaurar_backup() {
+    local sel
+    echo " Elegí un backup de la lista, o escribí la ruta de un .tar.gz"
+    echo " (por ejemplo, uno que subiste desde otro VPS)."
+    echo
+    listar_backups
+    echo "  0) Cancelar"
+    echo
+    read -rp "Número o ruta: " sel
+    [[ -z $sel || $sel == 0 ]] && { echo "Cancelado."; return; }
+    if [[ $sel =~ ^[0-9]+$ ]]; then
+        [[ $sel -le ${#BACKUPS[@]} ]] || { echo -e "${rojo}Opción no válida.${reset}"; return; }
+        sel=${BACKUPS[$((sel - 1))]}
+    fi
+    [[ -f $sel ]] || { echo -e "${rojo}No existe: ${sel}${reset}"; return; }
+
+    local tmp; tmp=$(mktemp -d)
+    if ! tar -xzf "$sel" -C "$tmp" auth.db ips_firewall.txt info.txt 2>/dev/null; then
+        echo -e "${rojo}El archivo no es un backup válido de menu2.${reset}"; rm -rf "$tmp"; return
+    fi
+    if ! sqlite3 "$tmp/auth.db" "SELECT COUNT(*) FROM IPADDRS;" >/dev/null 2>&1; then
+        echo -e "${rojo}auth.db del backup está dañada.${reset}"; rm -rf "$tmp"; return
+    fi
+
+    echo
+    echo -e "${negrita}Contenido del backup:${reset}"
+    grep -E '^(FECHA|IP_ORIGEN)=' "$tmp/info.txt" | sed 's/^/  /'
+    sqlite3 -header -column "$tmp/auth.db" "SELECT ID, created, ipaddr FROM IPADDRS ORDER BY ID;"
+    echo
+    echo -e "${amarillo}Se reemplazarán la base del panel y las IPs autorizadas del firewall.${reset}"
+    read -rp "¿Confirmás la restauración? [s/n]: " ok
+    [[ ${ok,,} == s* ]] || { echo "Cancelado."; rm -rf "$tmp"; return; }
+
+    # Backup automático del estado actual por si hay que volver atrás
+    echo "+ Guardando el estado actual antes de restaurar..."
+    crear_backup >/dev/null && echo "  (guardado en ${BACKUP_DIR})"
+
+    # 1) Base de datos
+    local owner; owner=$(stat -c '%U:%G' "$DB" 2>/dev/null || echo root:root)
+    systemctl stop netflix-proxy-admin
+    rm -f "${DB}-wal" "${DB}-shm" "${DB}-journal"
+    cp "$tmp/auth.db" "$DB"
+    chown "$owner" "$DB"
+
+    # Contraseña admin: la base trae el hash del backup, así que se usa su contraseña
+    local bpass; bpass=$(grep '^ADMIN_PASS=' "$tmp/info.txt" | cut -d= -f2)
+    if [[ $bpass =~ ^[A-Za-z0-9]+$ ]]; then
+        sed -i "s/^ADMIN_PASS=.*/ADMIN_PASS=${bpass}/" "$CONF"
+        ADMIN_PASS=$bpass
+    fi
+    systemctl start netflix-proxy-admin
+
+    # 2) Firewall: quitar las IPs actuales y poner las del backup + las de la base
+    local ip
+    for ip in $(ips_firewall); do quitar_reglas_ip "$ip"; done
+    for ip in $( { cat "$tmp/ips_firewall.txt"; sqlite3 "$DB" "SELECT ipaddr FROM IPADDRS;"; } | sort -u); do
+        valid_ip "$ip" && aplicar_reglas_ip "$ip"
+    done
+    netfilter-persistent save >/dev/null 2>&1
+    rm -rf "$tmp"
+
+    echo -e "${verde}Backup restaurado.${reset}"
+    echo "  Contraseña admin: ${ADMIN_PASS}"
+    echo "  IPs en el firewall: $(ips_firewall | wc -l)"
+    echo; ver_ips
+}
+
+eliminar_backup() {
+    listar_backups || return
+    echo "  a) Eliminar TODOS"
+    echo "  0) Cancelar"
+    echo
+    read -rp "¿Cuál eliminar?: " sel
+    if [[ ${sel,,} == a ]]; then
+        read -rp "¿Eliminar los ${#BACKUPS[@]} backups? [s/n]: " ok
+        [[ ${ok,,} == s* ]] && rm -f "$BACKUP_DIR"/np_backup_*.tar.gz && echo -e "${verde}Backups eliminados.${reset}"
+        return
+    fi
+    [[ $sel =~ ^[0-9]+$ && $sel -ge 1 && $sel -le ${#BACKUPS[@]} ]] || { echo "Cancelado."; return; }
+    rm -f "${BACKUPS[$((sel - 1))]}"
+    echo -e "${verde}Eliminado: $(basename "${BACKUPS[$((sel - 1))]}")${reset}"
+}
+
+menu_backup() {
+    while true; do
+        clear
+        echo -e "${negrita}============ BACKUP ============${reset}"
+        echo " Carpeta: ${BACKUP_DIR}"
+        echo "---------------------------------"
+        echo " 1) Crear backup (y ver cómo descargarlo)"
+        echo " 2) Restaurar backup"
+        echo " 3) Ver backups"
+        echo " 4) Eliminar backup"
+        echo " 0) Volver"
+        echo "---------------------------------"
+        read -rp "Opción: " bop
+        echo
+        case $bop in
+            1) crear_backup ;;
+            2) restaurar_backup ;;
+            3) listar_backups ;;
+            4) eliminar_backup ;;
+            0) return ;;
+            *) echo "Opción no válida." ;;
+        esac
+        pausa
+    done
+}
+
 while true; do
     clear
     echo -e "${negrita}========= NETFLIX-PROXY =========${reset}"
@@ -153,6 +331,7 @@ while true; do
     echo "10) Estado de servicios"
     echo "11) Reiniciar todos los servicios"
     echo "12) Comandos para el VPS del túnel"
+    echo "13) Backup"
     echo " 0) Salir"
     echo "---------------------------------"
     read -rp "Opción: " op
@@ -170,6 +349,7 @@ while true; do
         10) estado ;;
         11) reiniciar ;;
         12) comandos_tunel ;;
+        13) menu_backup; continue ;;
         0) exit 0 ;;
         *) echo "Opción no válida." ;;
     esac
