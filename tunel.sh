@@ -34,6 +34,9 @@ fallo() { echo -e "${rojo}[FALLO]${reset} $*"; }
 SCRIPT_URL="https://raw.githubusercontent.com/zuri360/netflix-proxy/refs/heads/main/tunel.sh"
 LOCAL_SCRIPT=/root/tunel.sh
 CMD=/usr/local/bin/dns
+CRON_FILE=/etc/cron.d/tunel-dns
+PAUSA=/etc/tunel-dns.pausado          # existe si la vigilancia quitó las reglas
+LOG=/var/log/tunel-dns.log
 
 # Guarda una copia local y crea el comando "dns", así se puede usar
 # aunque el DNS del VPS esté roto y no se pueda descargar de GitHub.
@@ -145,6 +148,74 @@ probar_internet() {
     fi
 }
 
+# ---------- Vigilancia automática (cron) ----------
+log_v() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+reglas_activas() { iptables -t nat -S OUTPUT | grep -- '--dport 53' | grep -q -- '-j DNAT'; }
+
+# Pregunta DIRECTO al proxy (sin pasar por las reglas): debe responder su IP
+# para ifconfig.co y la IP real para example.com. Si no, está caído o no autorizado.
+proxy_ok_directo() {
+    local a b
+    a=$(dig +short +time=3 +tries=2 "$TEST_DOMAIN" @"$PROXY_IP" 2>/dev/null | tail -1)
+    b=$(dig +short +time=3 +tries=2 example.com @"$PROXY_IP" 2>/dev/null | tail -1)
+    [[ "$a" == "$PROXY_IP" && -n "$b" && "$b" != "$PROXY_IP" && "$b" != *";;"* ]]
+}
+tcp_ok_directo() { dig +tcp +short +time=3 +tries=2 "$TEST_DOMAIN" @"$PROXY_IP" 2>/dev/null | grep -qx "$PROXY_IP"; }
+
+vigilar() {
+    [[ -f $CONF ]] || exit 0                       # nunca se configuró un proxy
+    command -v dig >/dev/null || exit 0
+    if reglas_activas; then
+        if ! proxy_ok_directo; then
+            limpiar_todas >/dev/null
+            netfilter-persistent save >/dev/null 2>&1
+            touch "$PAUSA"
+            log_v "Proxy ${PROXY_IP} caído o IP no autorizada -> reglas quitadas (usuarios con internet normal)"
+        fi
+    elif [[ -f $PAUSA ]]; then
+        if proxy_ok_directo; then
+            iptables -t nat -A OUTPUT $(regla udp)
+            tcp_ok_directo && iptables -t nat -A OUTPUT $(regla tcp)
+            netfilter-persistent save >/dev/null 2>&1
+            rm -f "$PAUSA"
+            log_v "Proxy ${PROXY_IP} responde y autorizado -> reglas reactivadas"
+        fi
+    fi
+}
+
+vigilancia_on() { [[ -f $CRON_FILE ]]; }
+
+vigilancia() {
+    if vigilancia_on; then
+        echo -e "Vigilancia automática: ${verde}ACTIVADA${reset} (revisa cada 2 minutos)"
+        read -rp "¿Desactivarla? (s/n): " r
+        if [[ "$r" =~ ^[sS]$ ]]; then
+            rm -f "$CRON_FILE" "$PAUSA"
+            ok "Vigilancia desactivada"
+        fi
+    else
+        echo -e "Vigilancia automática: ${rojo}DESACTIVADA${reset}"
+        echo "Si el proxy se cae o quitan la autorización, quita las reglas sola"
+        echo "(los usuarios siguen con internet) y las vuelve a poner cuando se arregla."
+        read -rp "¿Activarla? (s/n): " r
+        if [[ "$r" =~ ^[sS]$ ]]; then
+            [[ -f $LOCAL_SCRIPT ]] || { fallo "Falta $LOCAL_SCRIPT"; return; }
+            if ! command -v cron >/dev/null; then
+                apt-get -y -qq install cron >/dev/null 2>&1
+            fi
+            systemctl enable --now cron >/dev/null 2>&1
+            echo "*/2 * * * * root bash $LOCAL_SCRIPT vigilar >/dev/null 2>&1" > "$CRON_FILE"
+            chmod 644 "$CRON_FILE"
+            ok "Vigilancia activada (cada 2 minutos)"
+        fi
+    fi
+    if [[ -f $LOG ]]; then
+        echo; echo -e "${negrita}Últimos eventos:${reset}"
+        tail -5 "$LOG"
+    fi
+}
+
 activar() {
     # En el menú pregunta la IP; con "bash tunel.sh activar" usa la guardada
     if [[ "$1" != "auto" ]]; then
@@ -154,6 +225,7 @@ activar() {
         echo "PROXY_IP=${PROXY_IP}" > "$CONF"
     fi
 
+    rm -f "$PAUSA"
     # Borra las reglas anteriores (incluidas las que apuntan a otro proxy)
     local n; n=$(limpiar_todas)
     [[ $n -gt 0 ]] && info "Reglas anteriores quitadas: $n"
@@ -197,6 +269,7 @@ activar() {
 }
 
 quitar() {
+    rm -f "$PAUSA"     # quitado a propósito: la vigilancia no las reactiva
     local n; n=$(limpiar_todas)
     [[ $n -gt 0 ]] && ok "Reglas quitadas: $n" || info "No había reglas activas"
     command -v netfilter-persistent >/dev/null && guardar
@@ -205,6 +278,9 @@ quitar() {
 
 estado() {
     echo -e "${negrita}Proxy guardado:${reset} ${GUARDADA:-ninguno} (en uso: $PROXY_IP)"
+    vigilancia_on && echo -e "${negrita}Vigilancia:${reset} ${verde}activada${reset}" \
+                  || echo -e "${negrita}Vigilancia:${reset} desactivada"
+    [[ -f $PAUSA ]] && echo -e "${amarillo}Reglas pausadas por la vigilancia (proxy caído o IP no autorizada)${reset}"
     echo -e "${negrita}Reglas DNAT de DNS activas:${reset}"
     local reglas
     reglas=$(iptables -t nat -S OUTPUT | grep -- '--dport 53' | grep -- '-j DNAT')
@@ -229,7 +305,7 @@ desinstalar() {
     echo -e "${negrita}Esto revierte todo lo que hizo tunel.sh en este VPS:${reset}"
     echo " - Quita todas las reglas DNAT de DNS (de cualquier proxy, UDP y TCP)"
     echo " - Guarda el firewall sin esas reglas"
-    echo " - Borra la IP guardada (${CONF})"
+    echo " - Borra la IP guardada (${CONF}) y la vigilancia automática"
     echo " - Opcional: desinstala iptables-persistent y dnsutils"
     echo " - Opcional: borra el comando dns y /root/tunel.sh"
     read -rp "¿Continuar? (s/n): " r
@@ -239,6 +315,7 @@ desinstalar() {
     ok "Reglas DNAT quitadas: $n"
     command -v netfilter-persistent >/dev/null && guardar
     rm -f "$CONF" && GUARDADA="" && ok "IP guardada borrada"
+    rm -f "$CRON_FILE" "$PAUSA" "$LOG" && ok "Vigilancia automática quitada"
 
     read -rp "¿Desinstalar también iptables-persistent y dnsutils? (s/n): " r2
     if [[ "$r2" =~ ^[sS]$ ]]; then
@@ -266,6 +343,7 @@ case "$1" in
     quitar)      quitar;  exit ;;
     estado)      estado;  exit ;;
     desinstalar) desinstalar; exit ;;
+    vigilar)     vigilar; exit ;;
 esac
 
 while true; do
@@ -278,6 +356,7 @@ while true; do
     echo " 2) Quitar reglas"
     echo " 3) Estado y prueba"
     echo " 4) Desinstalar"
+    echo " 5) Vigilancia automática $(vigilancia_on && echo -e "[${verde}ON${reset}]" || echo "[OFF]")"
     echo " 0) Salir"
     echo "------------------------------------"
     read -rp "Opción: " op
@@ -287,6 +366,7 @@ while true; do
         2) quitar ;;
         3) estado ;;
         4) desinstalar ;;
+        5) vigilancia ;;
         0) exit 0 ;;
         *) echo "Opción no válida." ;;
     esac
